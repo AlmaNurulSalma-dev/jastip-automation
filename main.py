@@ -215,6 +215,14 @@ async def send_product_photo(
         else:
             caption += f"🏪 **Shop:** _Unknown_\n"
 
+        # Rating - always show
+        rating = product.get('rating', 0)
+        if rating and rating > 0:
+            stars = "⭐" * int(rating)
+            caption += f"⭐ **Rating:** {rating}/5 {stars}\n"
+        else:
+            caption += f"⭐ **Rating:** _No rating data_\n"
+
         # Sales count - always show
         sales = product.get('sales_count', 0)
         if sales > 0:
@@ -333,16 +341,20 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             products = await search_taobao(
                 keyword=parsed_params['keyword'],
                 max_price_cny=parsed_params.get('max_price'),
-                limit=15,  # Fetch 15 products to ensure we have enough
+                limit=10,  # Fetch 10 products (will show max 5)
                 platform='1688'  # Use 1688 instead of Taobao
             )
             logger.info(f"Scraped {len(products)} products from 1688")
 
-            # Debug: Log first product to verify data structure
+            # Debug: Log all products to verify uniqueness
             if products:
-                logger.info(f"First product sample: title={products[0].get('title', 'N/A')[:30]}, "
-                           f"price={products[0].get('price_cny', 0)}, "
-                           f"link={products[0].get('link', 'N/A')[:50]}")
+                logger.info("=== Scraped Products Debug ===")
+                for idx, p in enumerate(products[:5], 1):  # Log first 5
+                    logger.info(f"Product {idx}: title='{p.get('title', 'N/A')[:40]}', "
+                               f"price={p.get('price_cny', 0)}, "
+                               f"shop='{p.get('shop_name', 'N/A')[:20]}', "
+                               f"link_end='{p.get('link', 'N/A')[-20:]}'")
+                logger.info("==============================")
 
             # Check if scraping returned no results (likely CAPTCHA)
             if not products:
@@ -392,11 +404,18 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.info(f"Sending {len(products)} products as photos with buy buttons")
 
             # Send a brief message before products
-            products_to_show = min(len(products), 10)  # Show max 10 products
-            await update.message.reply_text(
-                f"🎉 **Found {len(products)} products!** Showing top {products_to_show}:\n",
-                parse_mode='Markdown'
-            )
+            products_to_show = min(len(products), 5)  # Show max 5 products
+            if products_to_show > 0:
+                await update.message.reply_text(
+                    f"🎉 **Found {len(products)} products!** Showing top {products_to_show}:\n",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ **No products found** matching your criteria.\n",
+                    parse_mode='Markdown'
+                )
+                return
 
             # Send each product as a photo
             for i, product in enumerate(products[:products_to_show], 1):
@@ -408,11 +427,11 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 # Small delay to avoid rate limiting
                 await asyncio.sleep(0.5)
 
-            # Notify if more products were saved
+            # Notify if more products were saved (but only showing 5)
             if len(products) > products_to_show:
                 await update.message.reply_text(
-                    f"💾 **{len(products) - products_to_show} more products** saved to database!\n"
-                    f"Search again with refined filters to see different results.",
+                    f"💾 **{len(products) - products_to_show} more products** found but only showing 5.\n"
+                    f"Try refining your search to see different results.",
                     parse_mode='Markdown'
                 )
 
