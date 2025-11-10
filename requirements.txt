@@ -1,0 +1,14 @@
+# Telegram Bot API wrapper
+python-telegram-bot>=20.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Google Gemini AI for query parsing
+google-generativeai>=0.3.0
+
+# HTTP requests for REST API fallback
+requests>=2.31.0
+
+# Web scraping with Playwright
+playwright>=1.40.0
