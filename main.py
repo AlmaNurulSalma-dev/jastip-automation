@@ -3,8 +3,9 @@ Telegram Bot for Jastip Automation.
 A production-ready bot with proper error handling and logging.
 """
 
+import asyncio
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -150,6 +151,111 @@ async def manual_search_command(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Error in manual_search_command: {e}")
 
 
+def format_price(price_cny: float) -> str:
+    """
+    Format price in CNY with IDR conversion.
+
+    Args:
+        price_cny: Price in Chinese Yuan
+
+    Returns:
+        Formatted price string with both CNY and IDR
+
+    Example:
+        >>> format_price(25.5)
+        '¥25.50 (~Rp 58,650)'
+    """
+    price_idr = price_cny * 2300  # Conversion rate: 1 CNY ≈ 2300 IDR
+    return f"¥{price_cny:.2f} (~Rp {price_idr:,.0f})"
+
+
+async def send_product_photo(
+    update: Update,
+    product: dict,
+    index: int,
+    total: int
+) -> None:
+    """
+    Send a product as a photo message with formatted caption and buy button.
+
+    Args:
+        update: The incoming update
+        product: Product dictionary from scraper
+        index: Product number (1-indexed)
+        total: Total number of products
+    """
+    try:
+        # Build caption with rich formatting
+        caption = f"🛍️ **Product {index}/{total}**\n\n"
+
+        # Title
+        title = product.get('title', 'N/A')[:100]  # Limit title length
+        caption += f"📦 **{title}**\n\n"
+
+        # Price (both CNY and IDR)
+        price_cny = product.get('price_cny', 0)
+        if price_cny > 0:
+            caption += f"💰 **Price:** {format_price(price_cny)}\n"
+
+        # Shop name
+        shop_name = product.get('shop_name', 'Unknown')
+        if shop_name and shop_name != 'Unknown':
+            caption += f"🏪 **Shop:** {shop_name}\n"
+
+        # Sales count
+        sales = product.get('sales_count', 0)
+        if sales > 0:
+            caption += f"📊 **Sales:** {sales:,} units\n"
+
+        # Location (if available)
+        location = product.get('location', '')
+        if location:
+            caption += f"📍 **Location:** {location}\n"
+
+        # Create "Buy Now" button
+        keyboard = None
+        product_link = product.get('link')
+        if product_link:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛒 Buy Now on 1688", url=product_link)]
+            ])
+
+        # Get image URL
+        image_url = product.get('image_url')
+
+        # Send photo with caption and button
+        if image_url:
+            try:
+                await update.message.reply_photo(
+                    photo=image_url,
+                    caption=caption,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+                return
+            except Exception as photo_error:
+                logger.warning(f"Failed to send photo for product {index}: {photo_error}")
+                # Fall through to text-only message
+
+        # Fallback: Send as text message if photo fails or not available
+        if product_link and keyboard:
+            await update.message.reply_text(
+                caption,
+                parse_mode='Markdown',
+                reply_markup=keyboard,
+                disable_web_page_preview=False
+            )
+        else:
+            await update.message.reply_text(caption, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"Error sending product {index}: {e}", exc_info=True)
+        # Send basic text fallback
+        await update.message.reply_text(
+            f"❌ Error displaying product {index}: {product.get('title', 'Unknown')[:50]}"
+        )
+
+
 async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Parse user search query using AI and return structured parameters.
@@ -242,17 +348,65 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # Log but don't fail if database save fails
             logger.warning(f"Failed to save search to database: {db_error}")
 
-        # Format the response with parsed parameters and products
-        response = _format_parsed_response(
+        # Send parsing summary first
+        summary = _format_parsing_summary(
             user_message,
             parsed_params,
-            parsing_successful,
-            products,
-            scraping_failed=scraping_failed
+            parsing_successful
         )
 
-        # Update the status message with the result
-        await status_message.edit_text(response)
+        await status_message.edit_text(summary, parse_mode='Markdown')
+
+        # Send products as photos with buy buttons
+        if products:
+            logger.info(f"Sending {len(products)} products as photos with buy buttons")
+
+            # Send a brief message before products
+            products_to_show = min(len(products), 5)  # Show max 5 products
+            await update.message.reply_text(
+                f"🎉 **Found {len(products)} products!** Showing top {products_to_show}:\n",
+                parse_mode='Markdown'
+            )
+
+            # Send each product as a photo
+            for i, product in enumerate(products[:products_to_show], 1):
+                await send_product_photo(update, product, i, products_to_show)
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(0.5)
+
+            # Notify if more products were saved
+            if len(products) > products_to_show:
+                await update.message.reply_text(
+                    f"💾 **{len(products) - products_to_show} more products** saved to database!\n"
+                    f"Search again with refined filters to see different results.",
+                    parse_mode='Markdown'
+                )
+
+        elif scraping_failed:
+            # Scraping failed - likely CAPTCHA
+            captcha_message = (
+                "🤖 **1688 requires verification to continue.**\n\n"
+                "📋 **Manual Search Option:**\n"
+                f"1. Open: https://s.1688.com/selloffer/offer_search.htm?keywords={quote(parsed_params['keyword'])}\n"
+                "2. Solve the slider CAPTCHA\n"
+                "3. Copy any product link from results\n"
+                "4. Send the link back to me\n\n"
+                "Or use /manual_search for detailed instructions\n"
+                "Or try again in a few minutes!\n\n"
+                "⚠️ Note: 1688 sometimes requires verification for wholesale sites."
+            )
+            await update.message.reply_text(captcha_message, parse_mode='Markdown', disable_web_page_preview=True)
+
+        else:
+            # No products found (not CAPTCHA, just no results)
+            await update.message.reply_text(
+                "⚠️ **No products found** matching your criteria.\n\n"
+                "💡 Try:\n"
+                "• Different keywords\n"
+                "• Adjusting price range\n"
+                "• Removing some filters",
+                parse_mode='Markdown'
+            )
 
         logger.info(f"Successfully parsed and responded to user {user_id}")
 
@@ -271,63 +425,63 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(error_message)
 
 
-def _format_parsed_response(
+def _format_parsing_summary(
     original_query: str,
     params: dict,
-    parsing_successful: bool = True,
-    products: list = None,
-    scraping_failed: bool = False
+    parsing_successful: bool = True
 ) -> str:
     """
-    Format the parsed search parameters and products into a user-friendly message.
+    Format the parsed search parameters into a summary message.
 
     Args:
         original_query: The original search query from the user.
         params: Dictionary containing parsed search parameters.
-        parsing_successful: Whether the parsing was successful (extracted parameters beyond just keyword).
-        products: List of scraped products to display.
-        scraping_failed: Whether scraping failed (CAPTCHA or error).
+        parsing_successful: Whether the parsing was successful.
 
     Returns:
-        Formatted string with parsed parameters, active filters, and products.
+        Formatted string with parsed parameters and active filters.
     """
     # Build the response message
     if parsing_successful:
-        response = "✅ Search Query Parsed Successfully!\n\n"
+        response = "✅ **Search Query Parsed Successfully!**\n\n"
     else:
-        response = "⚠️ Partial Parse - Using Keyword Search\n\n"
+        response = "⚠️ **Partial Parse** - Using Keyword Search\n\n"
 
-    response += f"📝 Original Query:\n\"{original_query}\"\n\n"
-    response += "🔍 Extracted Parameters:\n"
-    response += "─" * 30 + "\n\n"
+    response += f"📝 **Original Query:**\n\"{original_query}\"\n\n"
+    response += "🔍 **Extracted Parameters:**\n"
+    response += "─" * 30 + "\n"
 
     # Keyword (always present)
-    response += f"📦 Keyword: {params['keyword']}\n"
+    response += f"📦 **Keyword:** {params['keyword']}\n"
 
     # Color (optional)
     if params['color']:
-        response += f"🎨 Color: {params['color']}\n"
+        response += f"🎨 **Color:** {params['color']}\n"
 
     # Price range (optional)
     if params['min_price'] is not None or params['max_price'] is not None:
         if params['min_price'] is not None and params['max_price'] is not None:
-            response += f"💰 Price Range: ¥{params['min_price']} - ¥{params['max_price']} CNY\n"
+            min_idr = params['min_price'] * 2300
+            max_idr = params['max_price'] * 2300
+            response += f"💰 **Price Range:** ¥{params['min_price']}-{params['max_price']} (~Rp {min_idr:,.0f}-{max_idr:,.0f})\n"
         elif params['min_price'] is not None:
-            response += f"💰 Min Price: ¥{params['min_price']} CNY\n"
+            min_idr = params['min_price'] * 2300
+            response += f"💰 **Min Price:** ¥{params['min_price']} (~Rp {min_idr:,.0f})\n"
         elif params['max_price'] is not None:
-            response += f"💰 Max Price: ¥{params['max_price']} CNY\n"
+            max_idr = params['max_price'] * 2300
+            response += f"💰 **Max Price:** ¥{params['max_price']} (~Rp {max_idr:,.0f})\n"
 
     # Rating (optional)
     if params['min_rating'] is not None:
         stars = "⭐" * int(params['min_rating'])
-        response += f"⭐ Min Rating: {params['min_rating']}/5 {stars}\n"
+        response += f"⭐ **Min Rating:** {params['min_rating']}/5 {stars}\n"
 
     # Sales (optional)
     if params['min_sales'] is not None:
-        response += f"📊 Min Sales: {params['min_sales']:,} units\n"
+        response += f"📊 **Min Sales:** {params['min_sales']:,} units\n"
 
     # Add summary of active filters
-    response += "\n" + "─" * 30 + "\n"
+    response += "─" * 30 + "\n"
     active_filters = []
     if params['color']:
         active_filters.append("Color")
@@ -339,52 +493,16 @@ def _format_parsed_response(
         active_filters.append("Sales")
 
     if active_filters:
-        response += f"\n✓ Active Filters: {', '.join(active_filters)}"
+        response += f"✅ **Active Filters:** {', '.join(active_filters)}\n"
     else:
-        response += "\n💡 No filters specified - showing all results for keyword"
-
-    # Add products section if available
-    if products:
-        response += f"\n\n🛒 Found {len(products)} Products:\n"
-        response += "═" * 30 + "\n\n"
-
-        for i, product in enumerate(products[:5], 1):  # Show top 5 products
-            response += f"{i}. {product.get('title', 'N/A')[:60]}\n"
-            response += f"   💰 Price: ¥{product.get('price_cny', 0):.2f}\n"
-            response += f"   🏪 Shop: {product.get('shop_name', 'Unknown')}\n"
-            if product.get('sales_count'):
-                response += f"   📊 Sales: {product.get('sales_count'):,}\n"
-            if product.get('link'):
-                response += f"   🔗 Link: {product.get('link')}\n"
-            response += "\n"
-
-        if len(products) > 5:
-            response += f"... and {len(products) - 5} more products saved to database!\n"
-
-    elif products is not None and scraping_failed:
-        # Scraping failed - likely CAPTCHA
-        response += "\n\n🤖 1688 requires verification to continue.\n\n"
-        response += "📋 **Manual Search Option:**\n"
-        response += f"1. Open: https://s.1688.com/selloffer/offer_search.htm?keywords={quote(params['keyword'])}\n"
-        response += "2. Solve the slider CAPTCHA\n"
-        response += "3. Copy any product link from results\n"
-        response += "4. Send the link back to me\n\n"
-        response += "Or use /manual_search to search manually\n"
-        response += "Or try again in a few minutes!\n\n"
-        response += "⚠️ Note: 1688 sometimes requires verification. This is normal for wholesale sites."
-
-    elif products is not None:
-        # Scraping was attempted but no products found (not CAPTCHA, just no results)
-        response += "\n\n⚠️ No products found matching your criteria.\n"
-        response += "Try adjusting your search filters or keywords.\n\n"
-        response += "⚠️ Note: 1688 sometimes requires verification for automated searches."
+        response += "💡 **No filters** - showing all results for keyword\n"
 
     # Add tip if parsing failed
     if not parsing_successful:
-        response += "\n\n💡 Tip: Try being more specific with filters like:\n"
+        response += "\n💡 **Tip:** Try being more specific:\n"
         response += "• Price: 'harga 20rb-50rb' or 'under 100 CNY'\n"
         response += "• Color: 'hitam', 'pink', 'blue'\n"
-        response += "• Rating: 'rating 4+' or 'rating 4.5 keatas'\n"
+        response += "• Rating: 'rating 4+'\n"
         response += "• Sales: 'terjual 1000+'"
 
     return response
