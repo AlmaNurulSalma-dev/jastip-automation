@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class TaobaoScraper:
-    """Scrapes product listings from 1688.com (Alibaba wholesale platform)"""
+    """Scrapes product listings from 1688.com (Alibaba wholesale platform) and Pinduoduo"""
 
     def __init__(self, headless: bool = True, platform: str = '1688'):
         """
@@ -33,7 +33,7 @@ class TaobaoScraper:
 
         Args:
             headless: Run browser in headless mode (no GUI)
-            platform: Platform to scrape ('1688' or 'taobao')
+            platform: Platform to scrape ('1688', 'taobao', or 'pinduoduo')
         """
         self.headless = headless
         self.platform = platform
@@ -43,6 +43,9 @@ class TaobaoScraper:
             self.base_url = "https://s.1688.com/selloffer/offer_search.htm"
             self.mobile_url = "https://m.1688.com/offer_search/-{keyword}.html"
             logger.info("Using 1688.com (Alibaba wholesale platform)")
+        elif platform == 'pinduoduo':
+            self.base_url = "https://mobile.yangkeduo.com/search_result.html"
+            logger.info("Using Pinduoduo (拼多多) platform")
         else:
             self.base_url = "https://s.taobao.com/search"
             logger.info("Using Taobao platform")
@@ -156,6 +159,14 @@ class TaobaoScraper:
                         '.list-item',
                         '.gallery-offer-item',
                     ]
+                elif self.platform == 'pinduoduo':
+                    selectors_to_try = [
+                        '[class*="goods-item"]',  # Pinduoduo item class
+                        '[class*="GoodsItem"]',
+                        '[class*="search-goods"]',
+                        '.goods-card',
+                        '[data-goods-id]',
+                    ]
                 else:
                     selectors_to_try = [
                         '.item',
@@ -217,6 +228,19 @@ class TaobaoScraper:
             # Sort by relevance
             url += "&sortType=default"
 
+        elif self.platform == 'pinduoduo':
+            # Pinduoduo mobile URL format
+            url = f"{self.base_url}?search_key={encoded_keyword}"
+
+            # Add price filter if specified (Pinduoduo uses different format)
+            if max_price_cny:
+                # Pinduoduo price in Fen (1 CNY = 100 Fen)
+                max_price_fen = int(max_price_cny * 100)
+                url += f"&max_price={max_price_fen}"
+
+            # Sort by sales/popularity
+            url += "&sort=0"
+
         else:
             # Taobao URL format
             url = f"{self.base_url}?q={encoded_keyword}"
@@ -265,6 +289,8 @@ class TaobaoScraper:
         try:
             if self.platform == '1688':
                 return await self._extract_1688_product_info(item)
+            elif self.platform == 'pinduoduo':
+                return await self._extract_pinduoduo_product_info(item)
             else:
                 return await self._extract_taobao_product_info(item)
         except Exception as e:
@@ -407,6 +433,108 @@ class TaobaoScraper:
 
         except Exception as e:
             logger.warning(f"Error extracting Taobao product info: {str(e)}")
+            return None
+
+    async def _extract_pinduoduo_product_info(self, item) -> Optional[Dict]:
+        """Extract information from a Pinduoduo product item"""
+        try:
+            # Extract title
+            title_selectors = [
+                '[class*="goods-name"]',
+                '[class*="goodsName"]',
+                '[class*="title"]',
+                '.goods-title',
+                'a'
+            ]
+            title = "N/A"
+            for selector in title_selectors:
+                title_elem = await item.query_selector(selector)
+                if title_elem:
+                    if selector == 'a':
+                        title = await title_elem.get_attribute('title') or await title_elem.inner_text()
+                    else:
+                        title = await title_elem.inner_text()
+                    if title and title.strip():
+                        title = title.strip()
+                        break
+
+            # Extract price (Pinduoduo shows in Fen, need to convert to CNY)
+            price_selectors = [
+                '[class*="goods-price"]',
+                '[class*="price"]',
+                '.price-num'
+            ]
+            price = 0.0
+            for selector in price_selectors:
+                price_elem = await item.query_selector(selector)
+                if price_elem:
+                    price_text = await price_elem.inner_text()
+                    price = self._parse_price(price_text)
+                    if price > 0:
+                        break
+
+            # Extract product link
+            link_elem = await item.query_selector('a')
+            link = await link_elem.get_attribute('href') if link_elem else None
+            if link:
+                if not link.startswith('http'):
+                    if link.startswith('//'):
+                        link = f"https:{link}"
+                    else:
+                        link = f"https://mobile.yangkeduo.com{link}"
+
+            # Extract image URL
+            img_selectors = ['img', '[class*="goods-img"]', '[class*="image"]']
+            image_url = None
+            for selector in img_selectors:
+                img_elem = await item.query_selector(selector)
+                if img_elem:
+                    image_url = await img_elem.get_attribute('src') or await img_elem.get_attribute('data-src')
+                    if image_url:
+                        if not image_url.startswith('http'):
+                            image_url = f"https:{image_url}"
+                        break
+
+            # Extract shop/seller name (Pinduoduo may not always show shop name)
+            shop_selectors = ['[class*="shop-name"]', '[class*="merchant"]', '[class*="store"]']
+            shop_name = "Pinduoduo Seller"
+            for selector in shop_selectors:
+                shop_elem = await item.query_selector(selector)
+                if shop_elem:
+                    shop_name = await shop_elem.inner_text()
+                    shop_name = shop_name.strip() if shop_name else "Pinduoduo Seller"
+                    if shop_name:
+                        break
+
+            # Extract sales count
+            sales_selectors = [
+                '[class*="sales"]',
+                '[class*="sold"]',
+                '[class*="sales-count"]'
+            ]
+            sales = 0
+            for selector in sales_selectors:
+                sales_elem = await item.query_selector(selector)
+                if sales_elem:
+                    sales_text = await sales_elem.inner_text()
+                    sales = self._parse_sales(sales_text)
+                    if sales > 0:
+                        break
+
+            product = {
+                'title': title,
+                'price_cny': price,
+                'link': link,
+                'image_url': image_url,
+                'shop_name': shop_name,
+                'location': '',  # Pinduoduo doesn't always show location
+                'sales_count': sales
+            }
+
+            return product
+
+        except Exception as e:
+            logger.warning(f"Error extracting Pinduoduo product info: {str(e)}")
             return None
 
     def _parse_price(self, price_text: str) -> float:

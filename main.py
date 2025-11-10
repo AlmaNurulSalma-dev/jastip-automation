@@ -5,6 +5,7 @@ A production-ready bot with proper error handling and logging.
 
 import asyncio
 import logging
+from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
@@ -16,7 +17,7 @@ from telegram.ext import (
 from config import config
 from ai_parser import parse_search_query
 from database import init_database, save_search, save_scraped_products
-from taobao_scraper import search_taobao
+from taobao_scraper import search_taobao, TaobaoScraper
 from urllib.parse import quote
 
 # Configure logging
@@ -208,6 +209,11 @@ async def send_product_photo(
         else:
             caption += f"💰 **Price:** _Not available_\n"
 
+        # Platform - always show
+        platform = product.get('platform', '1688')
+        platform_emoji = "🏭" if platform == "1688" else "🛒"
+        caption += f"{platform_emoji} **Platform:** {platform}\n"
+
         # Shop name - always show
         shop_name = product.get('shop_name', '')
         if shop_name and shop_name.strip() and shop_name != 'Unknown':
@@ -247,8 +253,9 @@ async def send_product_photo(
         # Create "Buy Now" button only if link exists
         keyboard = None
         if product_link and product_link.strip():
+            button_text = f"🛒 Buy Now on {platform}"
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛒 Buy Now on 1688", url=product_link)]
+                [InlineKeyboardButton(button_text, url=product_link)]
             ])
 
         # Get image URL
@@ -286,6 +293,68 @@ async def send_product_photo(
         await update.message.reply_text(
             f"❌ Error displaying product {index}: {str(e)[:100]}"
         )
+
+
+async def search_multiple_platforms(
+    keyword: str,
+    max_price_cny: Optional[float] = None,
+    limit_per_platform: int = 5
+) -> list:
+    """
+    Search for products from multiple platforms (1688 and Pinduoduo) in parallel.
+
+    Args:
+        keyword: Search keyword
+        max_price_cny: Maximum price in CNY
+        limit_per_platform: Number of products to fetch per platform
+
+    Returns:
+        Merged list of products from all platforms
+    """
+    logger.info(f"Searching multiple platforms for: {keyword}")
+
+    # Create tasks for parallel scraping
+    tasks = []
+
+    # Task 1: Search 1688
+    scraper_1688 = TaobaoScraper(headless=True, platform='1688')
+    task_1688 = scraper_1688.search_products(keyword, max_price_cny, limit_per_platform)
+    tasks.append(('1688', task_1688))
+
+    # Task 2: Search Pinduoduo
+    scraper_pinduoduo = TaobaoScraper(headless=True, platform='pinduoduo')
+    task_pinduoduo = scraper_pinduoduo.search_products(keyword, max_price_cny, limit_per_platform)
+    tasks.append(('Pinduoduo', task_pinduoduo))
+
+    # Execute all tasks in parallel with error handling
+    all_products = []
+    for platform_name, task in tasks:
+        try:
+            products = await task
+            if products:
+                logger.info(f"Got {len(products)} products from {platform_name}")
+                # Add platform info to each product
+                for product in products:
+                    product['platform'] = platform_name
+                all_products.extend(products)
+            else:
+                logger.warning(f"No products from {platform_name}")
+        except Exception as e:
+            logger.error(f"Failed to scrape {platform_name}: {e}", exc_info=True)
+            # Continue even if one platform fails
+            continue
+
+    # Deduplicate based on title (in case same product appears on both platforms)
+    seen_titles = set()
+    unique_products = []
+    for product in all_products:
+        title_lower = product.get('title', '').lower()
+        if title_lower and title_lower not in seen_titles:
+            seen_titles.add(title_lower)
+            unique_products.append(product)
+
+    logger.info(f"Total unique products from all platforms: {len(unique_products)}")
+    return unique_products
 
 
 async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -328,23 +397,22 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             any(parsed_params.get(key) is not None for key in ['color', 'min_price', 'max_price', 'min_rating', 'min_sales'])
         )
 
-        # Update status: Scraping 1688
+        # Update status: Scraping multiple platforms
         await status_message.edit_text(
-            "✅ Query parsed!\n🔄 Searching 1688.com for products..."
+            "✅ Query parsed!\n🔄 Searching 1688 & Pinduoduo for products..."
         )
 
-        # Scrape 1688 for products
+        # Scrape from multiple platforms (1688 and Pinduoduo)
         products = []
         scraping_failed = False
         try:
-            logger.info(f"Scraping 1688 for: {parsed_params['keyword']}, max_price: {parsed_params.get('max_price')}")
-            products = await search_taobao(
+            logger.info(f"Scraping multiple platforms for: {parsed_params['keyword']}, max_price: {parsed_params.get('max_price')}")
+            products = await search_multiple_platforms(
                 keyword=parsed_params['keyword'],
                 max_price_cny=parsed_params.get('max_price'),
-                limit=10,  # Fetch 10 products (will show max 5)
-                platform='1688'  # Use 1688 instead of Taobao
+                limit_per_platform=5  # Get 5 from each platform = ~10 total
             )
-            logger.info(f"Scraped {len(products)} products from 1688")
+            logger.info(f"Scraped {len(products)} total products from all platforms")
 
             # Debug: Log all products to verify uniqueness
             if products:
@@ -371,7 +439,8 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await status_message.edit_text(
                     "✅ Query parsed!\n✅ Products found!\n🔄 Saving to database..."
                 )
-                saved_product_ids = save_scraped_products(products, platform='1688')
+                # Save products with mixed platforms
+                saved_product_ids = save_scraped_products(products, platform='multi')
                 logger.info(f"Saved {len(saved_product_ids)} products to database")
             except Exception as save_error:
                 logger.error(f"Failed to save products: {save_error}", exc_info=True)
