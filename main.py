@@ -185,46 +185,69 @@ async def send_product_photo(
         total: Total number of products
     """
     try:
+        # Debug log to check unique products
+        logger.info(f"Sending product {index}: {product.get('title', 'N/A')[:50]}")
+
         # Build caption with rich formatting
         caption = f"🛍️ **Product {index}/{total}**\n\n"
 
-        # Title
-        title = product.get('title', 'N/A')[:100]  # Limit title length
-        caption += f"📦 **{title}**\n\n"
+        # Title - show full title or indicate if missing
+        title = product.get('title', '')
+        if not title or title.strip() == '' or title == 'N/A':
+            caption += f"📦 **Title:** _(No title available)_\n\n"
+            logger.warning(f"Product {index} has no title: {product}")
+        else:
+            # Limit title but show more characters
+            title_display = title[:150] if len(title) > 150 else title
+            caption += f"📦 **{title_display}**\n\n"
 
-        # Price (both CNY and IDR)
+        # Price (both CNY and IDR) - always show even if 0
         price_cny = product.get('price_cny', 0)
         if price_cny > 0:
             caption += f"💰 **Price:** {format_price(price_cny)}\n"
+        else:
+            caption += f"💰 **Price:** _Not available_\n"
 
-        # Shop name
-        shop_name = product.get('shop_name', 'Unknown')
-        if shop_name and shop_name != 'Unknown':
+        # Shop name - always show
+        shop_name = product.get('shop_name', '')
+        if shop_name and shop_name.strip() and shop_name != 'Unknown':
             caption += f"🏪 **Shop:** {shop_name}\n"
+        else:
+            caption += f"🏪 **Shop:** _Unknown_\n"
 
-        # Sales count
+        # Sales count - always show
         sales = product.get('sales_count', 0)
         if sales > 0:
             caption += f"📊 **Sales:** {sales:,} units\n"
+        else:
+            caption += f"📊 **Sales:** _No sales data_\n"
 
         # Location (if available)
         location = product.get('location', '')
-        if location:
+        if location and location.strip():
             caption += f"📍 **Location:** {location}\n"
 
-        # Create "Buy Now" button
+        # Product link - ALWAYS show in caption
+        product_link = product.get('link', '')
+        if product_link and product_link.strip():
+            # Show shortened link in caption for reference
+            caption += f"\n🔗 **Link:** {product_link}\n"
+        else:
+            caption += f"\n🔗 **Link:** _Not available_\n"
+            logger.warning(f"Product {index} has no link")
+
+        # Create "Buy Now" button only if link exists
         keyboard = None
-        product_link = product.get('link')
-        if product_link:
+        if product_link and product_link.strip():
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🛒 Buy Now on 1688", url=product_link)]
             ])
 
         # Get image URL
-        image_url = product.get('image_url')
+        image_url = product.get('image_url', '')
 
         # Send photo with caption and button
-        if image_url:
+        if image_url and image_url.strip():
             try:
                 await update.message.reply_photo(
                     photo=image_url,
@@ -246,13 +269,14 @@ async def send_product_photo(
                 disable_web_page_preview=False
             )
         else:
-            await update.message.reply_text(caption, parse_mode='Markdown')
+            await update.message.reply_text(caption, parse_mode='Markdown', disable_web_page_preview=False)
 
     except Exception as e:
         logger.error(f"Error sending product {index}: {e}", exc_info=True)
+        logger.error(f"Product data: {product}")
         # Send basic text fallback
         await update.message.reply_text(
-            f"❌ Error displaying product {index}: {product.get('title', 'Unknown')[:50]}"
+            f"❌ Error displaying product {index}: {str(e)[:100]}"
         )
 
 
@@ -309,10 +333,16 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             products = await search_taobao(
                 keyword=parsed_params['keyword'],
                 max_price_cny=parsed_params.get('max_price'),
-                limit=10,  # Limit to 10 products
+                limit=15,  # Fetch 15 products to ensure we have enough
                 platform='1688'  # Use 1688 instead of Taobao
             )
             logger.info(f"Scraped {len(products)} products from 1688")
+
+            # Debug: Log first product to verify data structure
+            if products:
+                logger.info(f"First product sample: title={products[0].get('title', 'N/A')[:30]}, "
+                           f"price={products[0].get('price_cny', 0)}, "
+                           f"link={products[0].get('link', 'N/A')[:50]}")
 
             # Check if scraping returned no results (likely CAPTCHA)
             if not products:
@@ -362,7 +392,7 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.info(f"Sending {len(products)} products as photos with buy buttons")
 
             # Send a brief message before products
-            products_to_show = min(len(products), 5)  # Show max 5 products
+            products_to_show = min(len(products), 10)  # Show max 10 products
             await update.message.reply_text(
                 f"🎉 **Found {len(products)} products!** Showing top {products_to_show}:\n",
                 parse_mode='Markdown'
@@ -370,6 +400,10 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             # Send each product as a photo
             for i, product in enumerate(products[:products_to_show], 1):
+                # Log each product to verify uniqueness
+                logger.debug(f"Product {i} title: {product.get('title', 'N/A')[:50]}")
+                logger.debug(f"Product {i} link: {product.get('link', 'N/A')[:50]}")
+
                 await send_product_photo(update, product, i, products_to_show)
                 # Small delay to avoid rate limiting
                 await asyncio.sleep(0.5)
