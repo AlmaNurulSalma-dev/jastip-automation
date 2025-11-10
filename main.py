@@ -5,6 +5,7 @@ A production-ready bot with proper error handling and logging.
 
 import asyncio
 import logging
+from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
@@ -16,7 +17,7 @@ from telegram.ext import (
 from config import config
 from ai_parser import parse_search_query
 from database import init_database, save_search, save_scraped_products
-from taobao_scraper import search_taobao
+from taobao_scraper import search_taobao, TaobaoScraper
 from urllib.parse import quote
 
 # Configure logging
@@ -185,46 +186,83 @@ async def send_product_photo(
         total: Total number of products
     """
     try:
+        # Debug log to check unique products
+        logger.info(f"Sending product {index}: {product.get('title', 'N/A')[:50]}")
+
         # Build caption with rich formatting
         caption = f"🛍️ **Product {index}/{total}**\n\n"
 
-        # Title
-        title = product.get('title', 'N/A')[:100]  # Limit title length
-        caption += f"📦 **{title}**\n\n"
+        # Title - show full title or indicate if missing
+        title = product.get('title', '')
+        if not title or title.strip() == '' or title == 'N/A':
+            caption += f"📦 **Title:** _(No title available)_\n\n"
+            logger.warning(f"Product {index} has no title: {product}")
+        else:
+            # Limit title but show more characters
+            title_display = title[:150] if len(title) > 150 else title
+            caption += f"📦 **{title_display}**\n\n"
 
-        # Price (both CNY and IDR)
+        # Price (both CNY and IDR) - always show even if 0
         price_cny = product.get('price_cny', 0)
         if price_cny > 0:
             caption += f"💰 **Price:** {format_price(price_cny)}\n"
+        else:
+            caption += f"💰 **Price:** _Not available_\n"
 
-        # Shop name
-        shop_name = product.get('shop_name', 'Unknown')
-        if shop_name and shop_name != 'Unknown':
+        # Platform - always show
+        platform = product.get('platform', '1688')
+        platform_emoji = "🏭" if platform == "1688" else "🛒"
+        caption += f"{platform_emoji} **Platform:** {platform}\n"
+
+        # Shop name - always show
+        shop_name = product.get('shop_name', '')
+        if shop_name and shop_name.strip() and shop_name != 'Unknown':
             caption += f"🏪 **Shop:** {shop_name}\n"
+        else:
+            caption += f"🏪 **Shop:** _Unknown_\n"
 
-        # Sales count
+        # Rating - always show
+        rating = product.get('rating', 0)
+        if rating and rating > 0:
+            stars = "⭐" * int(rating)
+            caption += f"⭐ **Rating:** {rating}/5 {stars}\n"
+        else:
+            caption += f"⭐ **Rating:** _No rating data_\n"
+
+        # Sales count - always show
         sales = product.get('sales_count', 0)
         if sales > 0:
             caption += f"📊 **Sales:** {sales:,} units\n"
+        else:
+            caption += f"📊 **Sales:** _No sales data_\n"
 
         # Location (if available)
         location = product.get('location', '')
-        if location:
+        if location and location.strip():
             caption += f"📍 **Location:** {location}\n"
 
-        # Create "Buy Now" button
+        # Product link - ALWAYS show in caption
+        product_link = product.get('link', '')
+        if product_link and product_link.strip():
+            # Show shortened link in caption for reference
+            caption += f"\n🔗 **Link:** {product_link}\n"
+        else:
+            caption += f"\n🔗 **Link:** _Not available_\n"
+            logger.warning(f"Product {index} has no link")
+
+        # Create "Buy Now" button only if link exists
         keyboard = None
-        product_link = product.get('link')
-        if product_link:
+        if product_link and product_link.strip():
+            button_text = f"🛒 Buy Now on {platform}"
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛒 Buy Now on 1688", url=product_link)]
+                [InlineKeyboardButton(button_text, url=product_link)]
             ])
 
         # Get image URL
-        image_url = product.get('image_url')
+        image_url = product.get('image_url', '')
 
         # Send photo with caption and button
-        if image_url:
+        if image_url and image_url.strip():
             try:
                 await update.message.reply_photo(
                     photo=image_url,
@@ -246,14 +284,77 @@ async def send_product_photo(
                 disable_web_page_preview=False
             )
         else:
-            await update.message.reply_text(caption, parse_mode='Markdown')
+            await update.message.reply_text(caption, parse_mode='Markdown', disable_web_page_preview=False)
 
     except Exception as e:
         logger.error(f"Error sending product {index}: {e}", exc_info=True)
+        logger.error(f"Product data: {product}")
         # Send basic text fallback
         await update.message.reply_text(
-            f"❌ Error displaying product {index}: {product.get('title', 'Unknown')[:50]}"
+            f"❌ Error displaying product {index}: {str(e)[:100]}"
         )
+
+
+async def search_multiple_platforms(
+    keyword: str,
+    max_price_cny: Optional[float] = None,
+    limit_per_platform: int = 5
+) -> list:
+    """
+    Search for products from multiple platforms (1688 and Pinduoduo) in parallel.
+
+    Args:
+        keyword: Search keyword
+        max_price_cny: Maximum price in CNY
+        limit_per_platform: Number of products to fetch per platform
+
+    Returns:
+        Merged list of products from all platforms
+    """
+    logger.info(f"Searching multiple platforms for: {keyword}")
+
+    # Create tasks for parallel scraping
+    tasks = []
+
+    # Task 1: Search 1688
+    scraper_1688 = TaobaoScraper(headless=True, platform='1688')
+    task_1688 = scraper_1688.search_products(keyword, max_price_cny, limit_per_platform)
+    tasks.append(('1688', task_1688))
+
+    # Task 2: Search Pinduoduo
+    scraper_pinduoduo = TaobaoScraper(headless=True, platform='pinduoduo')
+    task_pinduoduo = scraper_pinduoduo.search_products(keyword, max_price_cny, limit_per_platform)
+    tasks.append(('Pinduoduo', task_pinduoduo))
+
+    # Execute all tasks in parallel with error handling
+    all_products = []
+    for platform_name, task in tasks:
+        try:
+            products = await task
+            if products:
+                logger.info(f"Got {len(products)} products from {platform_name}")
+                # Add platform info to each product
+                for product in products:
+                    product['platform'] = platform_name
+                all_products.extend(products)
+            else:
+                logger.warning(f"No products from {platform_name}")
+        except Exception as e:
+            logger.error(f"Failed to scrape {platform_name}: {e}", exc_info=True)
+            # Continue even if one platform fails
+            continue
+
+    # Deduplicate based on title (in case same product appears on both platforms)
+    seen_titles = set()
+    unique_products = []
+    for product in all_products:
+        title_lower = product.get('title', '').lower()
+        if title_lower and title_lower not in seen_titles:
+            seen_titles.add(title_lower)
+            unique_products.append(product)
+
+    logger.info(f"Total unique products from all platforms: {len(unique_products)}")
+    return unique_products
 
 
 async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -296,23 +397,32 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             any(parsed_params.get(key) is not None for key in ['color', 'min_price', 'max_price', 'min_rating', 'min_sales'])
         )
 
-        # Update status: Scraping 1688
+        # Update status: Scraping multiple platforms
         await status_message.edit_text(
-            "✅ Query parsed!\n🔄 Searching 1688.com for products..."
+            "✅ Query parsed!\n🔄 Searching 1688 & Pinduoduo for products..."
         )
 
-        # Scrape 1688 for products
+        # Scrape from multiple platforms (1688 and Pinduoduo)
         products = []
         scraping_failed = False
         try:
-            logger.info(f"Scraping 1688 for: {parsed_params['keyword']}, max_price: {parsed_params.get('max_price')}")
-            products = await search_taobao(
+            logger.info(f"Scraping multiple platforms for: {parsed_params['keyword']}, max_price: {parsed_params.get('max_price')}")
+            products = await search_multiple_platforms(
                 keyword=parsed_params['keyword'],
                 max_price_cny=parsed_params.get('max_price'),
-                limit=10,  # Limit to 10 products
-                platform='1688'  # Use 1688 instead of Taobao
+                limit_per_platform=5  # Get 5 from each platform = ~10 total
             )
-            logger.info(f"Scraped {len(products)} products from 1688")
+            logger.info(f"Scraped {len(products)} total products from all platforms")
+
+            # Debug: Log all products to verify uniqueness
+            if products:
+                logger.info("=== Scraped Products Debug ===")
+                for idx, p in enumerate(products[:5], 1):  # Log first 5
+                    logger.info(f"Product {idx}: title='{p.get('title', 'N/A')[:40]}', "
+                               f"price={p.get('price_cny', 0)}, "
+                               f"shop='{p.get('shop_name', 'N/A')[:20]}', "
+                               f"link_end='{p.get('link', 'N/A')[-20:]}'")
+                logger.info("==============================")
 
             # Check if scraping returned no results (likely CAPTCHA)
             if not products:
@@ -329,7 +439,8 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await status_message.edit_text(
                     "✅ Query parsed!\n✅ Products found!\n🔄 Saving to database..."
                 )
-                saved_product_ids = save_scraped_products(products, platform='1688')
+                # Save products with mixed platforms
+                saved_product_ids = save_scraped_products(products, platform='multi')
                 logger.info(f"Saved {len(saved_product_ids)} products to database")
             except Exception as save_error:
                 logger.error(f"Failed to save products: {save_error}", exc_info=True)
@@ -363,22 +474,33 @@ async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             # Send a brief message before products
             products_to_show = min(len(products), 5)  # Show max 5 products
-            await update.message.reply_text(
-                f"🎉 **Found {len(products)} products!** Showing top {products_to_show}:\n",
-                parse_mode='Markdown'
-            )
+            if products_to_show > 0:
+                await update.message.reply_text(
+                    f"🎉 **Found {len(products)} products!** Showing top {products_to_show}:\n",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ **No products found** matching your criteria.\n",
+                    parse_mode='Markdown'
+                )
+                return
 
             # Send each product as a photo
             for i, product in enumerate(products[:products_to_show], 1):
+                # Log each product to verify uniqueness
+                logger.debug(f"Product {i} title: {product.get('title', 'N/A')[:50]}")
+                logger.debug(f"Product {i} link: {product.get('link', 'N/A')[:50]}")
+
                 await send_product_photo(update, product, i, products_to_show)
                 # Small delay to avoid rate limiting
                 await asyncio.sleep(0.5)
 
-            # Notify if more products were saved
+            # Notify if more products were saved (but only showing 5)
             if len(products) > products_to_show:
                 await update.message.reply_text(
-                    f"💾 **{len(products) - products_to_show} more products** saved to database!\n"
-                    f"Search again with refined filters to see different results.",
+                    f"💾 **{len(products) - products_to_show} more products** found but only showing 5.\n"
+                    f"Try refining your search to see different results.",
                     parse_mode='Markdown'
                 )
 
